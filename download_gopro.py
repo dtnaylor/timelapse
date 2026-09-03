@@ -28,7 +28,8 @@ from rich.table import Table
 from rich.text import Text
 
 BASE_DIR_DEFAULT = os.path.expanduser("~/Pictures/GoPro")
-GOPRO_URL_DEFAULT = "http://10.5.5.9:8080/videos/DCIM/100GOPRO/"
+GOPRO_URL_DEFAULT = "http://10.5.5.9:8080"
+MEDIA_LIST_ENDPOINTS = ("/gopro/media/list", "/gp/gpMediaList")
 PARALLEL_JOBS_DEFAULT = 15
 CHUNK_SIZE = 64 * 1024
 MAX_RETRIES = 3
@@ -57,24 +58,60 @@ def parse_args():
         description="Download GoPro media files over the camera's web server with a live TUI."
     )
     p.add_argument("--base-dir", default=BASE_DIR_DEFAULT, help="base media library directory")
-    p.add_argument("--url", default=GOPRO_URL_DEFAULT, help="GoPro web server directory URL")
+    p.add_argument("--url", default=GOPRO_URL_DEFAULT, help="GoPro web server base URL (host[:port])")
     p.add_argument("--jobs", type=int, default=PARALLEL_JOBS_DEFAULT, help="parallel download workers")
     p.add_argument("--subdir", default=None, help="subdirectory under base-dir for new files")
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     return p.parse_args()
 
 
-def list_media(url):
-    """Fetch the directory listing and return sorted media filenames (no .LRV)."""
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    names = []
-    for href in re.findall(r'href="([^"]+)"', resp.text):
-        name = os.path.basename(href.rstrip("/"))
-        ext = ext_key(name)
-        if ext in TYPE_DIRS and not name.upper().endswith(".LRV"):
-            names.append(name)
-    return sorted(set(names))
+def list_media(base_url):
+    """Return media files across every DCIM directory.
+
+    Uses GoPro's JSON media-list endpoint (HERO9+/OpenGoPro primary, legacy
+    gpMediaList fallback), which reports files grouped by directory. Returns a
+    sorted list of (name, download_url, size) for supported media; LRV/THM
+    proxies are excluded.
+    """
+    for endpoint in MEDIA_LIST_ENDPOINTS:
+        try:
+            resp = requests.get(base_url + endpoint, timeout=15)
+            if resp.status_code != 200:
+                continue
+            return _parse_media_list(base_url, resp.json())
+        except (requests.RequestException, ValueError):
+            continue
+    raise requests.RequestException(
+        f"no media-list endpoint available at {base_url}"
+    )
+
+
+def _parse_media_list(base_url, payload):
+    media = []
+    for group in payload.get("media", []):
+        directory = group.get("d", "")
+        for f in group.get("fs", []):
+            name = f.get("n", "")
+            ext = ext_key(name)
+            if ext not in TYPE_DIRS:
+                continue
+            if name.upper().endswith((".LRV", ".THM")):
+                continue
+            url = f"{base_url}/videos/DCIM/{directory}/{name}"
+            size = 0
+            try:
+                size = int(f.get("s", 0) or 0)
+            except ValueError:
+                size = 0
+            media.append((name, url, size))
+    names = set()
+    deduped = []
+    for name, url, size in media:
+        if name in names:
+            continue
+        names.add(name)
+        deduped.append((name, url, size))
+    return sorted(deduped)
 
 
 def scan_library(base_dir):
@@ -86,6 +123,18 @@ def scan_library(base_dir):
                 continue
             found.setdefault(name, os.path.join(root, name))
     return found
+
+
+def scan_dir_size(directory):
+    """Sum file sizes in directory (ignoring .part files)."""
+    total = 0
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            if name.endswith(".part"):
+                continue
+            path = os.path.join(root, name)
+            total += os.path.getsize(path)
+    return total
 
 
 def pick_default_subdir(base_dir):
@@ -121,7 +170,7 @@ def _download_once(name, dest, url, q, stop):
         start = os.path.getsize(dest)
 
     headers = {"Range": f"bytes={start}-"} if start > 0 else {}
-    with requests.get(url + name, stream=True, headers=headers, timeout=30) as resp:
+    with requests.get(url, stream=True, headers=headers, timeout=30) as resp:
         if resp.status_code == 416:
             # Range starts at the end: file is already complete on disk.
             return "skipped", start, time.monotonic() - started
@@ -134,6 +183,19 @@ def _download_once(name, dest, url, q, stop):
         except ValueError:
             remaining = 0
         resumed = resp.status_code == 206
+
+        # If we sent a Range request but got a 200 (full file) back,
+        # the file is already complete on disk — skip re-downloading.
+        if start > 0 and not resumed:
+            return "skipped", start, time.monotonic() - started
+
+        # A resume that reports no remaining bytes means the file is already
+        # complete on disk (some GoPro firmware answers an at-EOF range with a
+        # 206 + empty body instead of 416). Refuse to clobber `dest` with an
+        # empty/partial file.
+        if start > 0 and remaining <= 0:
+            return "skipped", start, time.monotonic() - started
+
         file_total = remaining if not resumed else (start + remaining)
         if file_total:
             q.put(("total", name, file_total))
@@ -151,7 +213,10 @@ def _download_once(name, dest, url, q, stop):
                 written += len(chunk)
                 q.put(("progress", name, base + written))
 
-        os.replace(part, dest)
+        # Only replace `dest` once we actually wrote fresh bytes to `.part`;
+        # otherwise we'd overwrite a good file with a truncated one.
+        if written > 0:
+            os.replace(part, dest)
 
     status = "resumed" if start > 0 else "new"
     size = file_total if file_total is not None else (start + written)
@@ -184,12 +249,14 @@ class SyncState:
         self.skipped = 0
         self.errors = 0
         self.retries = 0
+        self.session_bytes = 0
+        self.subdir_bytes = 0
 
 
 def main():
     args = parse_args()
     base_dir = os.path.abspath(os.path.expanduser(args.base_dir))
-    url = args.url.rstrip("/") + "/"
+    url = args.url.rstrip("/")
     sub = args.subdir or pick_default_subdir(base_dir)
     target_dir = os.path.join(base_dir, sub)
 
@@ -209,7 +276,7 @@ def main():
         return
 
     existing = scan_library(base_dir)
-    new_count = sum(1 for f in media if f not in existing)
+    new_count = sum(1 for f in media if f[0] not in existing)
 
     print("")
     print("============================================================")
@@ -236,6 +303,7 @@ def main():
     q = queue.Queue()
     stop = threading.Event()
     state = SyncState(len(media))
+    state.subdir_bytes = scan_dir_size(target_dir)
 
     # --- overall bar: full width, count-based -------------------------
     overall = Progress(
@@ -251,7 +319,7 @@ def main():
     type_task = {}
     for ext, label in TYPE_LABELS.items():
         p = Progress(BarColumn(bar_width=None, complete_style=ORANGE_LIGHT, finished_style=ORANGE_LIGHT), console=console, expand=True)
-        count = sum(1 for f in media if ext_key(f) == ext)
+        count = sum(1 for f in media if ext_key(f[0]) == ext)
         if count == 0:
             type_task[ext] = p.add_task("", total=1, completed=1)
         else:
@@ -344,7 +412,7 @@ def main():
 
             sidebar_rows = [
                 _blank(),
-                _heading("Files"),
+                _heading("Downloads"),
                 _stat(f"{state.done} / {state.total_files} downloaded"),
                 _stat(f"{state.skipped} skipped"),
                 _stat(f"{state.retries} retries"),
@@ -352,6 +420,10 @@ def main():
                 _blank(),
                 _heading("Elapsed"),
                 _stat(format_duration(elapsed)),
+                _blank(),
+                _heading("Size"),
+                _stat(f"Session: {fmt_bytes(state.session_bytes)}"),
+                _stat(f"Subdir:  {fmt_bytes(state.subdir_bytes)}"),
             ]
             bottom_h = console.height - 6  # panel = 4 content rows + 2 ROUNDED borders
             sidebar = Group(
@@ -406,6 +478,9 @@ def main():
                     state.skipped += 1
                 elif status in ("new", "resumed"):
                     state.downloaded += 1
+                    state.session_bytes += size or 0
+                    if name in in_target:
+                        state.subdir_bytes += size or 0
                 elif status == "error":
                     state.errors += 1
                 ext = ext_key(name)
@@ -424,10 +499,13 @@ def main():
 
     futures = {}
     pool = ThreadPoolExecutor(max_workers=args.jobs)
-    for name in media:
+    in_target = set()
+    for name, file_url, _size in media:
         ext = ext_key(name)
         dest = existing.get(name) or os.path.join(target_dir, TYPE_DIRS[ext], name)
-        futures[pool.submit(run_worker, name, dest, url, q, stop)] = name
+        if os.path.commonpath([dest, target_dir]) == target_dir:
+            in_target.add(name)
+        futures[pool.submit(run_worker, name, dest, file_url, q, stop)] = name
 
     interrupted = False
     tick = 0

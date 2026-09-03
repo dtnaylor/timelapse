@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Mock GoPro HERO web server for testing the downloader without a camera.
 
-Serves a GoPro-style directory listing at /videos/DCIM/100GOPRO/ with byte-range
-support (200/206/416), and generates a realistic set of test media files on
-startup. Run `make server` (or this script directly) and point download_gopro_tui
-at the printed URL.
+Serves GoPro's JSON media-list endpoint (/gopro/media/list) plus per-directory
+file downloads under /videos/DCIM/<DIR>/ with byte-range support (200/206/416),
+and generates a realistic set of test media files spread across multiple DCIM
+directories on startup. Run `make server` (or this script directly) and point
+download_gopro.py at the printed base URL.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -16,7 +18,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-DIR_PATH = "/videos/DCIM/100GOPRO"
+DCIM_ROOT = "/videos/DCIM"
 CHUNK = 64 * 1024
 
 DEFAULTS = {
@@ -25,6 +27,7 @@ DEFAULTS = {
     "shots": 120,          # number of JPG shots
     "gprs": 120,           # number of .GPR raws
     "videos": 2,           # number of .MP4 clips
+    "dirs": 2,             # number of DCIM directories to spread files across
     "jpg_size": 512 * 1024,
     "gpr_size": 2 * 1024 * 1024,
     "mp4_size": 1024 * 1024,
@@ -43,6 +46,8 @@ def parse_args():
     p.add_argument("--shots", type=int, default=DEFAULTS["shots"], help="number of JPG shots")
     p.add_argument("--gprs", type=int, default=DEFAULTS["gprs"], help="number of GPR raws")
     p.add_argument("--videos", type=int, default=DEFAULTS["videos"], help="number of MP4 clips")
+    p.add_argument("--dirs", type=int, default=DEFAULTS["dirs"], metavar="N",
+                   help="number of DCIM directories to spread files across")
     for name, size in (("jpg", "jpg_size"), ("gpr", "gpr_size"), ("mp4", "mp4_size"), ("lrv", "lrv_size")):
         p.add_argument(f"--{name}-size", type=int, default=DEFAULTS[size], metavar="BYTES",
                        help=f"{name.upper()} file size in bytes")
@@ -53,14 +58,23 @@ def shot_number(i):
     return f"G{i + 1:07d}"
 
 
+def dcim_dir(i):
+    return f"1{i:02d}GOPRO"
+
+
 def generate_files(args):
-    """Create the test media set in args.dir. Returns the list of filenames."""
+    """Create the test media set under args.dir, spread across DCIM dirs.
+
+    Returns an ordered list of (directory, filename)."""
     os.makedirs(args.dir, exist_ok=True)
     files = []
+    dirs = max(1, args.dirs)
 
-    def ensure(name, size):
-        path = os.path.join(args.dir, name)
-        files.append(name)
+    def ensure(directory, name, size):
+        sub = os.path.join(args.dir, directory)
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, name)
+        files.append((directory, name))
         if os.path.isfile(path) and os.path.getsize(path) == size:
             return
         tmp = path + ".gen"
@@ -74,26 +88,28 @@ def generate_files(args):
         os.replace(tmp, path)
 
     for i in range(args.shots):
-        ensure(f"{shot_number(i)}.JPG", args.jpg_size)
+        ensure(dcim_dir(i % dirs), f"{shot_number(i)}.JPG", args.jpg_size)
     for i in range(args.gprs):
-        ensure(f"{shot_number(i)}.GPR", args.gpr_size)
+        ensure(dcim_dir(i % dirs), f"{shot_number(i)}.GPR", args.gpr_size)
     for i in range(args.videos):
         base = shot_number(i)
-        ensure(f"{base}.MP4", args.mp4_size)
-        ensure(f"{base}.LRV", args.lrv_size)
+        ensure(dcim_dir(i % dirs), f"{base}.MP4", args.mp4_size)
+        ensure(dcim_dir(i % dirs), f"{base}.LRV", args.lrv_size)
 
     return files
 
 
-def build_listing(files):
-    hrefs = "".join(
-        f'<p><a href="{DIR_PATH}/{f}">{f}</a></p>'
-        for f in files
-    )
-    return (
-        f"<html><head><title>Index of {DIR_PATH}</title></head><body>"
-        f"<h1>Index of {DIR_PATH}</h1>{hrefs}</body></html>"
-    ).encode()
+def build_media_list(data_dir, files):
+    """Build the /gopro/media/list JSON payload: files grouped by directory."""
+    groups = {}
+    for directory, name in files:
+        path = os.path.join(data_dir, directory, name)
+        groups.setdefault(directory, []).append({
+            "n": name,
+            "s": str(os.path.getsize(path)),
+        })
+    media = [{"d": d, "fs": fs} for d, fs in groups.items()]
+    return json.dumps({"id": "mock", "media": media}).encode()
 
 
 class GoProHandler(BaseHTTPRequestHandler):
@@ -104,31 +120,41 @@ class GoProHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = unquote(urlsplit(self.path).path.rstrip("/"))
-        if path == DIR_PATH:
-            return self.send_listing()
-        if path.startswith(DIR_PATH + "/"):
-            name = os.path.basename(path)
-            return self.send_file(name)
+        if path == "/gopro/media/list":
+            return self.send_media_list()
+        if path.startswith(DCIM_ROOT + "/"):
+            return self.send_file_from_path(path)
         self.send_error(404)
 
-    def send_listing(self):
-        body = self.server.listing
+    def send_media_list(self):
+        body = self.server.media_list
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def send_file(self, name):
-        if not re.match(r"^[A-Za-z0-9]+\.(JPG|GPR|MP4|LRV)$", name):
+    def send_file_from_path(self, path):
+        rel = path[len(DCIM_ROOT):].lstrip("/")
+        parts = rel.split("/")
+        if len(parts) != 2:
             self.send_error(404)
             return
-        path = os.path.join(self.server.data_dir, name)
-        if not os.path.isfile(path):
+        directory, name = parts
+        if not re.match(r"^1\d\dGOPRO$", directory):
             self.send_error(404)
             return
-        size = os.path.getsize(path)
+        if not re.match(r"^[A-Za-z0-9]+\.(JPG|GPR|MP4|LRV|THM)$", name):
+            self.send_error(404)
+            return
+        full = os.path.join(self.server.data_dir, directory, name)
+        if not os.path.isfile(full):
+            self.send_error(404)
+            return
+        self.stream_file(full)
 
+    def stream_file(self, path):
+        size = os.path.getsize(path)
         rng = self.headers.get("Range")
         if rng and rng.startswith("bytes="):
             start = self._parse_range(rng, size)
@@ -185,7 +211,7 @@ class MockServer(ThreadingHTTPServer):
     def __init__(self, addr, data_dir, files, throttle):
         super().__init__(addr, GoProHandler)
         self.data_dir = data_dir
-        self.listing = build_listing(files)
+        self.media_list = build_media_list(data_dir, files)
         self.throttle = throttle
 
 
@@ -193,7 +219,10 @@ def main():
     args = parse_args()
     files = generate_files(args)
 
-    total = sum(os.path.getsize(os.path.join(args.dir, f)) for f in files)
+    total = sum(
+        os.path.getsize(os.path.join(args.dir, directory, name))
+        for directory, name in files
+    )
     host, port = args.host, args.port
     server = None
     while True:
@@ -204,13 +233,15 @@ def main():
             port += 1
 
     counts = {
-        "JPG": sum(f.endswith(".JPG") for f in files),
-        "GPR": sum(f.endswith(".GPR") for f in files),
-        "MP4": sum(f.endswith(".MP4") for f in files),
-        "LRV": sum(f.endswith(".LRV") for f in files),
+        "JPG": sum(f[1].endswith(".JPG") for f in files),
+        "GPR": sum(f[1].endswith(".GPR") for f in files),
+        "MP4": sum(f[1].endswith(".MP4") for f in files),
+        "LRV": sum(f[1].endswith(".LRV") for f in files),
     }
+    dirs = sorted({d for d, _ in files})
     print("Mock GoPro serving:")
-    print(f"  Listing:  http://{host}:{port}{DIR_PATH}/")
+    print(f"  Media list: http://{host}:{port}/gopro/media/list")
+    print(f"  Directories: {', '.join(dirs)}")
     print(f"  Data:     {os.path.abspath(args.dir)}")
     print(f"  Files:    {counts['JPG']} JPG · {counts['GPR']} GPR · {counts['MP4']} MP4 "
           f"(+{counts['LRV']} LRV)  ~{total / 1000 / 1000:.1f} MB")
