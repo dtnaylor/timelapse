@@ -100,15 +100,67 @@ def generate_files(args):
 
 
 def build_media_list(data_dir, files):
-    """Build the /gopro/media/list JSON payload: files grouped by directory."""
+    """Build the /gopro/media/list JSON payload: files grouped by directory.
+
+    Mirrors real GoPro output: consecutive burst/timelapse frames (same lead,
+    same 5-char chapter, frame numbers +1) are collapsed into a single entry
+    with `n` = first frame, `b`/`l` = first/last frame numbers, `t` = "b", `g`
+    = the numeric chapter, and `s` = the group's total size. Photos also carry
+    `raw` = "1" when a .GPR twin exists; raw files are never listed themselves.
+    Videos stay as single-file entries."""
     groups = {}
+    prev_num = {}
     for directory, name in files:
         path = os.path.join(data_dir, directory, name)
-        groups.setdefault(directory, []).append({
-            "n": name,
-            "s": str(os.path.getsize(path)),
-        })
-    media = [{"d": d, "fs": fs} for d, fs in groups.items()]
+        size = str(os.path.getsize(path))
+        m = re.match(r"^(?P<lead>[A-Za-z]+)(?P<num>\d+)(?P<ext>\.JPG|\.GPR)$", name)
+        if m and m.group("ext") == ".GPR":
+            continue  # raws are exposed via the `raw` flag on the JPG entry
+        entries = groups.setdefault(directory, [])
+        if m and entries and prev_num.get(directory) == int(m.group("num")) - 1:
+            last = entries[-1]
+            last_m = re.match(r"^(?P<lead>[A-Za-z]+)(?P<num>\d+)", last["n"])
+            if (
+                last_m
+                and last_m.group("lead") == m.group("lead")
+                and last_m.group("num")[:3] == m.group("num")[:3]
+            ):
+                last["l"] = m.group("num")
+                last["s"] = str(int(last["s"]) + int(size))
+                prev_num[directory] = int(m.group("num"))
+                continue
+        if m:
+            num = m.group("num")
+            entries.append({
+                "n": name,
+                "g": str(int(num[:3])),
+                "b": str(int(num)),
+                "l": str(int(num)),
+                "t": "b",
+                "s": size,
+            })
+        else:
+            entries.append({"n": name, "s": size})
+        prev_num[directory] = int(m.group("num")) if m else int(prev_num.get(directory, 0))
+
+    for directory, fs in groups.items():
+        for e in fs:
+            if "b" not in e:
+                continue
+            gm = re.match(r"^(?P<lead>[A-Za-z]+)(?P<num>\d+)", e["n"])
+            if not gm:
+                continue
+            first, last = int(e["b"]), int(e["l"])
+            start = int(gm.group("num"))
+            width = len(gm.group("num"))
+            raws = [
+                f"{gm.group('lead')}{start + (i - first):0{width}d}.GPR"
+                for i in range(first, last + 1)
+            ]
+            if all(os.path.isfile(os.path.join(data_dir, directory, r)) for r in raws):
+                e["raw"] = "1"
+
+    media = [{"d": d, "fs": fs} for d, fs in sorted(groups.items())]
     return json.dumps({"id": "mock", "media": media}).encode()
 
 

@@ -86,6 +86,61 @@ def list_media(base_url):
     )
 
 
+_GROUP_NAME_RE = re.compile(r"^(?P<lead>[A-Za-z]+)(?P<num>\d+)(?P<ext>\.[A-Za-z0-9]+)$")
+
+
+def _expand_group(f, directory, base_url):
+    """Yield (name, url, size) for every frame in a grouped media-list entry.
+
+    The camera collapses consecutive timelapse/burst frames into one entry:
+    `n` is the *first* frame, `b`/`l` are the first/last frame numbers of the
+    group, `s` is the group's total size. Frames are named by offsetting the
+    numeric value embedded in the first frame's name, zero-padded to the same
+    width.  Entries without `b`/`l` (e.g. videos) are single files.
+    """
+    name = f.get("n", "")
+    try:
+        first, last = int(f["b"]), int(f["l"])
+    except (KeyError, ValueError):
+        first = last = None
+
+    if first is None or last < first:
+        yield name, f"{base_url}/videos/DCIM/{directory}/{name}", _int_size(f)
+        return
+
+    m = _GROUP_NAME_RE.match(name)
+    if not m:
+        yield name, f"{base_url}/videos/DCIM/{directory}/{name}", _int_size(f)
+        return
+    lead, num, ext = m.group("lead"), m.group("num"), m.group("ext")
+    start = int(num)
+    width = len(num)
+    count = last - first + 1
+    size = _int_size(f) // count
+
+    for idx in range(first, last + 1):
+        frame = f"{lead}{start + (idx - first):0{width}d}{ext}"
+        yield frame, f"{base_url}/videos/DCIM/{directory}/{frame}", size
+
+
+def _int_size(f):
+    try:
+        return int(f.get("s", 0) or 0)
+    except ValueError:
+        return 0
+
+
+def _raw_enabled(f):
+    """True when the camera captured a raw (.GPR) alongside this photo entry.
+
+    The media list never lists .GPR files; each JPG entry carries a `raw` flag
+    (int 1 or string "1") signalling the raw twin exists in the same folder."""
+    raw = f.get("raw")
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes")
+    return raw in (1, True)
+
+
 def _parse_media_list(base_url, payload):
     media = []
     for group in payload.get("media", []):
@@ -97,13 +152,13 @@ def _parse_media_list(base_url, payload):
                 continue
             if name.upper().endswith((".LRV", ".THM")):
                 continue
-            url = f"{base_url}/videos/DCIM/{directory}/{name}"
-            size = 0
-            try:
-                size = int(f.get("s", 0) or 0)
-            except ValueError:
-                size = 0
-            media.append((name, url, size))
+            for item in _expand_group(f, directory, base_url):
+                media.append(item)
+                if ext == "JPG" and _raw_enabled(f):
+                    jpg_name, jpg_url, _size = item
+                    raw_name = jpg_name[:-4] + ".GPR"
+                    raw_url = f"{base_url}/videos/DCIM/{directory}/{raw_name}"
+                    media.append((raw_name, raw_url, 0))
     names = set()
     deduped = []
     for name, url, size in media:
